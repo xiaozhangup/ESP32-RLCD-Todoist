@@ -7,9 +7,9 @@
 #include <freertos/semphr.h>
 #include <freertos/task.h>
 
-static constexpr uint32_t LVGL_TICK_PERIOD_MS = 5;
-static constexpr uint32_t LVGL_TASK_MAX_DELAY_MS = 500;
-static constexpr uint32_t LVGL_TASK_MIN_DELAY_MS = 10;
+static constexpr uint32_t LVGL_TICK_PERIOD_MS = 20;
+static constexpr uint32_t LVGL_TASK_MAX_DELAY_MS = 50;
+static constexpr uint32_t LVGL_TASK_MIN_DELAY_MS = 20;
 
 static SemaphoreHandle_t lvgl_mutex = nullptr;
 

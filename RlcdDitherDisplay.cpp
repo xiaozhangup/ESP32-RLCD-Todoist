@@ -6,14 +6,31 @@
 static constexpr uint32_t SPI_CLK = 24000000;
 
 static_assert(RlcdDitherDisplay::DITHER_BLOCK_SIZE == 5, "DITHER_5X5 must match DITHER_BLOCK_SIZE");
+static_assert(RlcdDitherDisplay::BAYER_BLOCK_SIZE == 8, "BAYER_8X8 must match BAYER_BLOCK_SIZE");
+static_assert(RlcdDitherDisplay::TEMPORAL_PHASES == 8, "TEMPORAL_ORDER_8 must match TEMPORAL_PHASES");
 
-// Low values are written first, so darker blocks get the most visually even dots.
+// Low values turn black first, so darker tones spread dots evenly in a 5x5 cell.
 static constexpr uint8_t DITHER_5X5[25] = {
   0, 13, 3, 16, 6,
   18, 8, 21, 11, 24,
   4, 17, 1, 14, 7,
   22, 12, 19, 9, 23,
   2, 15, 5, 20, 10,
+};
+
+static constexpr uint8_t BAYER_8X8[64] = {
+  0, 48, 12, 60, 3, 51, 15, 63,
+  32, 16, 44, 28, 35, 19, 47, 31,
+  8, 56, 4, 52, 11, 59, 7, 55,
+  40, 24, 36, 20, 43, 27, 39, 23,
+  2, 50, 14, 62, 1, 49, 13, 61,
+  34, 18, 46, 30, 33, 17, 45, 29,
+  10, 58, 6, 54, 9, 57, 5, 53,
+  42, 26, 38, 22, 41, 25, 37, 21,
+};
+
+static constexpr uint8_t TEMPORAL_ORDER_8[RlcdDitherDisplay::TEMPORAL_PHASES] = {
+  0, 4, 2, 6, 1, 5, 3, 7,
 };
 
 RlcdDitherDisplay::RlcdDitherDisplay(int sck, int mosi, int dc, int cs, int rst)
@@ -26,6 +43,9 @@ RlcdDitherDisplay::~RlcdDitherDisplay() {
   }
   if (_gray_buffer) {
     free(_gray_buffer);
+  }
+  if (_tx_buffer) {
+    free(_tx_buffer);
   }
   _spi.end();
 }
@@ -40,13 +60,17 @@ bool RlcdDitherDisplay::begin() {
 
   _lcd_buffer = static_cast<uint8_t *>(heap_caps_malloc(BUFFER_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
   _gray_buffer = static_cast<uint8_t *>(heap_caps_malloc(WIDTH * HEIGHT, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+  _tx_buffer = static_cast<uint8_t *>(heap_caps_malloc(BUFFER_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
   if (!_lcd_buffer) {
     _lcd_buffer = static_cast<uint8_t *>(malloc(BUFFER_SIZE));
   }
   if (!_gray_buffer) {
     _gray_buffer = static_cast<uint8_t *>(malloc(WIDTH * HEIGHT));
   }
-  if (!_lcd_buffer || !_gray_buffer) {
+  if (!_tx_buffer) {
+    _tx_buffer = static_cast<uint8_t *>(malloc(BUFFER_SIZE));
+  }
+  if (!_lcd_buffer || !_gray_buffer || !_tx_buffer) {
     return false;
   }
 
@@ -56,6 +80,7 @@ bool RlcdDitherDisplay::begin() {
   initPanel();
   clear(true);
   display();
+  _last_temporal_frame_ms = millis();
   return true;
 }
 
@@ -71,25 +96,84 @@ void RlcdDitherDisplay::flushLvgl(const lv_area_t *area, const uint8_t *color_ma
   const int y2 = area->y2 >= HEIGHT ? HEIGHT - 1 : area->y2;
   const int area_w = area->x2 - area->x1 + 1;
   const uint16_t *src = reinterpret_cast<const uint16_t *>(color_map);
+  int dirty_x1 = WIDTH;
+  int dirty_y1 = HEIGHT;
+  int dirty_x2 = -1;
+  int dirty_y2 = -1;
 
   for (int y = y1; y <= y2; y++) {
     const int src_y = y - area->y1;
     for (int x = x1; x <= x2; x++) {
       const int src_x = x - area->x1;
-      _gray_buffer[y * WIDTH + x] = rgb565ToLuma(src[src_y * area_w + src_x]);
+      const uint8_t luma = rgb565ToLuma(src[src_y * area_w + src_x]);
+      uint8_t &old_luma = _gray_buffer[y * WIDTH + x];
+      if (old_luma != luma) {
+        old_luma = luma;
+        if (x < dirty_x1) dirty_x1 = x;
+        if (x > dirty_x2) dirty_x2 = x;
+        if (y < dirty_y1) dirty_y1 = y;
+        if (y > dirty_y2) dirty_y2 = y;
+      }
     }
   }
 
-  ditherBlocks(x1, y1, x2, y2);
-  display();
+  if (dirty_x2 < dirty_x1 || dirty_y2 < dirty_y1) {
+    return;
+  }
+
+  const int tx_x1 = dirty_x1 & ~1;
+  const int tx_x2 = dirty_x2 | 1;
+  const int block_y_min = (HEIGHT - 1 - dirty_y2) >> 2;
+  const int block_y_max = (HEIGHT - 1 - dirty_y1) >> 2;
+  const int block_start = (block_y_min / 3) * 3;
+  int block_end = (block_y_max / 3) * 3 + 2;
+  if (block_end >= HEIGHT / 4) {
+    block_end = HEIGHT / 4 - 1;
+  }
+  const int tx_y1 = max(0, HEIGHT - 1 - ((block_end << 2) + 3));
+  const int tx_y2 = min(HEIGHT - 1, HEIGHT - 1 - (block_start << 2));
+
+  renderArea(tx_x1, tx_y1, tx_x2, tx_y2);
+  displayArea(tx_x1, tx_y1, tx_x2, tx_y2);
 }
 
 void RlcdDitherDisplay::display() {
-  const uint8_t col_bounds[] = {0x12, 0x2A};
-  const uint8_t row_bounds[] = {0x00, 0xC7};
-  commandData(0x2A, col_bounds, sizeof(col_bounds));
-  commandData(0x2B, row_bounds, sizeof(row_bounds));
-  commandData(0x2C, _lcd_buffer, BUFFER_SIZE);
+  displayArea(0, 0, WIDTH - 1, HEIGHT - 1);
+}
+
+void RlcdDitherDisplay::setDitherMode(DitherMode mode) {
+  _mode = mode;
+  _temporal_phase = 0;
+  renderArea(0, 0, WIDTH - 1, HEIGHT - 1);
+  display();
+}
+
+bool RlcdDitherDisplay::updateTemporalFrame(uint32_t now_ms) {
+  if (_mode != DitherMode::Hybrid5x5Temporal8) {
+    return false;
+  }
+  if (now_ms - _last_temporal_frame_ms < HYBRID_FRAME_INTERVAL_MS) {
+    return false;
+  }
+
+  _last_temporal_frame_ms = now_ms;
+  _temporal_phase = (_temporal_phase + 1) % TEMPORAL_PHASES;
+  renderArea(0, 0, WIDTH - 1, HEIGHT - 1);
+  display();
+  return true;
+}
+
+void RlcdDitherDisplay::showDiagonalGradient() {
+  static constexpr uint32_t max_sum = (WIDTH - 1) + (HEIGHT - 1);
+
+  for (int y = 0; y < HEIGHT; y++) {
+    for (int x = 0; x < WIDTH; x++) {
+      _gray_buffer[y * WIDTH + x] = ((x + y) * 255U) / max_sum;
+    }
+  }
+
+  renderArea(0, 0, WIDTH - 1, HEIGHT - 1);
+  display();
 }
 
 void RlcdDitherDisplay::reset() {
@@ -202,33 +286,94 @@ void RlcdDitherDisplay::setPixel(int x, int y, bool white) {
   }
 }
 
-void RlcdDitherDisplay::ditherBlocks(int x1, int y1, int x2, int y2) {
-  const int bx1 = x1 / DITHER_BLOCK_SIZE;
-  const int by1 = y1 / DITHER_BLOCK_SIZE;
-  const int bx2 = x2 / DITHER_BLOCK_SIZE;
-  const int by2 = y2 / DITHER_BLOCK_SIZE;
+void RlcdDitherDisplay::displayArea(int x1, int y1, int x2, int y2) {
+  if (!_tx_buffer || x2 < x1 || y2 < y1) {
+    return;
+  }
 
-  for (int by = by1; by <= by2; by++) {
-    for (int bx = bx1; bx <= bx2; bx++) {
-      ditherBlock(bx, by);
+  if (x1 < 0) x1 = 0;
+  if (y1 < 0) y1 = 0;
+  if (x2 >= WIDTH) x2 = WIDTH - 1;
+  if (y2 >= HEIGHT) y2 = HEIGHT - 1;
+
+  const int byte_x_start = x1 >> 1;
+  const int byte_x_end = x2 >> 1;
+
+  const int block_y_min = (HEIGHT - 1 - y2) >> 2;
+  const int block_y_max = (HEIGHT - 1 - y1) >> 2;
+  const int block_start = (block_y_min / 3) * 3;
+  int block_end = (block_y_max / 3) * 3 + 2;
+  if (block_end >= HEIGHT / 4) {
+    block_end = HEIGHT / 4 - 1;
+  }
+
+  const uint8_t raw_col_start = 0x12 + block_start / 3;
+  const uint8_t raw_col_end = 0x12 + block_end / 3;
+  const uint8_t col_start = 0x3C - raw_col_end;
+  const uint8_t col_end = 0x3C - raw_col_start;
+  const uint8_t row_start = static_cast<uint8_t>(byte_x_start);
+  const uint8_t row_end = static_cast<uint8_t>(byte_x_end);
+  const int bytes_per_row = block_end - block_start + 1;
+  const int rows = byte_x_end - byte_x_start + 1;
+
+  size_t out = 0;
+  for (int bx = byte_x_start; bx <= byte_x_end; bx++) {
+    const uint8_t *src = _lcd_buffer + bx * (HEIGHT >> 2) + block_start;
+    memcpy(_tx_buffer + out, src, bytes_per_row);
+    out += bytes_per_row;
+  }
+
+  const uint8_t col_bounds[] = {col_start, col_end};
+  const uint8_t row_bounds[] = {row_start, row_end};
+  commandData(0x2A, col_bounds, sizeof(col_bounds));
+  commandData(0x2B, row_bounds, sizeof(row_bounds));
+  commandData(0x2C, _tx_buffer, static_cast<size_t>(rows) * bytes_per_row);
+}
+
+void RlcdDitherDisplay::renderArea(int x1, int y1, int x2, int y2) {
+  for (int y = y1; y <= y2; y++) {
+    for (int x = x1; x <= x2; x++) {
+      setPixel(x, y, renderPixel(x, y, _gray_buffer[y * WIDTH + x]));
     }
   }
 }
 
-void RlcdDitherDisplay::ditherBlock(int block_x, int block_y) {
-  const int x0 = block_x * DITHER_BLOCK_SIZE;
-  const int y0 = block_y * DITHER_BLOCK_SIZE;
-  const int x_end = (x0 + DITHER_BLOCK_SIZE) > WIDTH ? WIDTH : x0 + DITHER_BLOCK_SIZE;
-  const int y_end = (y0 + DITHER_BLOCK_SIZE) > HEIGHT ? HEIGHT : y0 + DITHER_BLOCK_SIZE;
-
-  for (int y = y0; y < y_end; y++) {
-    for (int x = x0; x < x_end; x++) {
-      const uint8_t luma = _gray_buffer[y * WIDTH + x];
-      const uint8_t black_level = ((255 - luma) * 25 + 127) / 255;
-      const uint8_t threshold_index = (y - y0) * DITHER_BLOCK_SIZE + (x - x0);
-      setPixel(x, y, DITHER_5X5[threshold_index] >= black_level);
-    }
+bool RlcdDitherDisplay::renderPixel(int x, int y, uint8_t luma) const {
+  switch (_mode) {
+    case DitherMode::BinaryThreshold:
+      return luma >= 128;
+    case DitherMode::Spatial5x5:
+      return renderPixelSpatial5x5(x, y, luma);
+    case DitherMode::Spatial8x8:
+      return renderPixelSpatial8x8(x, y, luma);
+    case DitherMode::Hybrid5x5Temporal8:
+      return renderPixelHybrid5x5Temporal8(x, y, luma);
   }
+
+  return renderPixelSpatial8x8(x, y, luma);
+}
+
+bool RlcdDitherDisplay::renderPixelSpatial5x5(int x, int y, uint8_t luma) const {
+  const uint8_t threshold_index = (y % DITHER_BLOCK_SIZE) * DITHER_BLOCK_SIZE + (x % DITHER_BLOCK_SIZE);
+  const uint8_t black = 255 - luma;
+  const uint8_t black_level = (black * 25 + 127) / 255;
+  return DITHER_5X5[threshold_index] >= black_level;
+}
+
+bool RlcdDitherDisplay::renderPixelSpatial8x8(int x, int y, uint8_t luma) const {
+  const uint8_t threshold_index = (y % BAYER_BLOCK_SIZE) * BAYER_BLOCK_SIZE + (x % BAYER_BLOCK_SIZE);
+  const uint8_t black = 255 - luma;
+  const uint8_t black_level = (black * 64 + 127) / 255;
+  return BAYER_8X8[threshold_index] >= black_level;
+}
+
+bool RlcdDitherDisplay::renderPixelHybrid5x5Temporal8(int x, int y, uint8_t luma) const {
+  const uint8_t threshold_index = (y % DITHER_BLOCK_SIZE) * DITHER_BLOCK_SIZE + (x % DITHER_BLOCK_SIZE);
+  const uint8_t spatial_order = DITHER_5X5[threshold_index];
+  const uint8_t black = 255 - luma;
+  const uint16_t black_slots = (black * (25 * TEMPORAL_PHASES) + 127) / 255;
+  const uint16_t threshold = spatial_order * TEMPORAL_PHASES + TEMPORAL_ORDER_8[_temporal_phase];
+  return threshold >= black_slots;
 }
 
 uint8_t RlcdDitherDisplay::rgb565ToLuma(uint16_t color) {
