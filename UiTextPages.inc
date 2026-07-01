@@ -248,10 +248,10 @@ static int measureTextWidthScaled(const String &text, int scale_num, int scale_d
     }
 
     lv_font_glyph_dsc_t glyph;
-    if (lv_font_get_glyph_dsc(&fusion_pixel_10_zh, &glyph, cp, 0)) {
+    if (findGlyphFont(cp, glyph)) {
       width += scaleCeil(glyphAdvance(glyph), scale_num, scale_den);
     } else {
-      width += scaleCeil(fusion_pixel_10_zh.line_height, scale_num, scale_den) / 2;
+      width += scaleCeil(displayFontLineHeight(), scale_num, scale_den) / 2;
     }
   }
   return width;
@@ -273,8 +273,9 @@ static int measureTextMinYOffset(const String &text) {
     }
 
     lv_font_glyph_dsc_t glyph;
-    if (lv_font_get_glyph_dsc(&fusion_pixel_10_zh, &glyph, cp, 0)) {
-      const int glyph_y = fusion_pixel_10_zh.line_height - fusion_pixel_10_zh.base_line -
+    const lv_font_t *font = findGlyphFont(cp, glyph);
+    if (font) {
+      const int glyph_y = displayFontLineOffset(font) + font->line_height - font->base_line -
                           glyph.box_h - glyph.ofs_y;
       min_y = min(min_y, glyph_y);
     }
@@ -413,15 +414,16 @@ static void drawTextScaled(const String &text, int x, int y, int scale_num, int 
     }
 
     lv_font_glyph_dsc_t glyph;
-    if (!lv_font_get_glyph_dsc(&fusion_pixel_10_zh, &glyph, cp, 0)) {
-      cursor_x += scaleCeil(fusion_pixel_10_zh.line_height, scale_num, scale_den) / 2;
+    const lv_font_t *font = findGlyphFont(cp, glyph);
+    if (!font) {
+      cursor_x += scaleCeil(displayFontLineHeight(), scale_num, scale_den) / 2;
       continue;
     }
 
     glyph.req_raw_bitmap = 1;
-    const uint8_t *bitmap = static_cast<const uint8_t *>(glyph.resolved_font->get_glyph_bitmap(&glyph, nullptr));
+    const uint8_t *bitmap = static_cast<const uint8_t *>(font->get_glyph_bitmap(&glyph, nullptr));
     if (bitmap && glyph.box_w > 0 && glyph.box_h > 0) {
-      const int raw_y = fusion_pixel_10_zh.line_height - fusion_pixel_10_zh.base_line -
+      const int raw_y = displayFontLineOffset(font) + font->line_height - font->base_line -
                         glyph.box_h - glyph.ofs_y;
       const int glyph_x = cursor_x + scaleCeil(glyph.ofs_x, scale_num, scale_den);
       const int glyph_y = y + scaleCeil(raw_y - min_y, scale_num, scale_den);
@@ -778,20 +780,23 @@ static int drawRightStatusArea(int battery_snapshot, bool tf_card_snapshot) {
 }
 
 static constexpr int MEDIA_ICON_DRAW_SIZE = 48;
+static constexpr int MEDIA_ICON_BOX_SIZE = 56;
+static constexpr int MEDIA_ICON_PADDING = 4;
 
 static void drawMediaIcon(const MediaInfo &media, int x, int y) {
-  drawRectOutline(x, y, MEDIA_ICON_DRAW_SIZE, MEDIA_ICON_DRAW_SIZE, 1, CANVAS_BLACK);
+  static constexpr int BORDER = 2;
+  drawRectOutline(x, y, MEDIA_ICON_BOX_SIZE, MEDIA_ICON_BOX_SIZE, BORDER, CANVAS_BLACK);
+  const int image_x = x + MEDIA_ICON_PADDING;
+  const int image_y = y + MEDIA_ICON_PADDING;
   if (!media.has_icon) {
-    drawText("♪", x + 15, y + 10, BODY_SCALE);
+    drawText("♪", image_x + 15, image_y + 10, BODY_SCALE);
     return;
   }
   for (int yy = 0; yy < MEDIA_ICON_DRAW_SIZE; yy++) {
     for (int xx = 0; xx < MEDIA_ICON_DRAW_SIZE; xx++) {
-      const int src_y = yy * MEDIA_ICON_SIZE / MEDIA_ICON_DRAW_SIZE;
-      const int src_x = xx * MEDIA_ICON_SIZE / MEDIA_ICON_DRAW_SIZE;
-      const int bit = src_y * MEDIA_ICON_SIZE + src_x;
+      const int bit = yy * MEDIA_ICON_SIZE + xx;
       if (media.icon[bit / 8] & (0x80 >> (bit % 8))) {
-        setCanvasPixel(x + xx, y + yy, CANVAS_BLACK);
+        setCanvasPixel(image_x + xx, image_y + yy, CANVAS_BLACK);
       }
     }
   }
@@ -878,13 +883,13 @@ static void renderMediaBar(const MediaInfo &media, int y, uint32_t now_ms) {
   static constexpr int ICON_GAP = 10;
   static constexpr int BAR_H = 14;
   static constexpr int STATUS_ICON_W = 10;
-  const int text_x = X + MEDIA_ICON_DRAW_SIZE + ICON_GAP;
+  const int text_x = X + MEDIA_ICON_BOX_SIZE + ICON_GAP;
   const int text_right = RIGHT - 1;
   const int title_y = y - 1;
   const int meta_y = y + 26;
   const int bar_y = y + 53;
   const int block_center_y = (title_y + bar_y + BAR_H) / 2;
-  const int icon_y = block_center_y - MEDIA_ICON_DRAW_SIZE / 2 + 6;
+  const int icon_y = block_center_y - MEDIA_ICON_BOX_SIZE / 2 + 6;
   const uint32_t position = mediaPositionNow(media, now_ms);
   const String duration_text = media.duration_ms > 0 ? formatMediaTime(media.duration_ms, false) : String("--:--");
   const String time_text = formatMediaTime(position, true) + "/" + duration_text;
@@ -971,7 +976,7 @@ static void renderTaskScreen(const std::vector<TaskDisplayItem> &task_items,
   if (refresh_state != RefreshVisualState::Idle) {
     static constexpr int REFRESH_ICON_SIZE = 20;
     const int title_right = 6 + measureTextWidth("Todoist", TITLE_SCALE);
-    const int title_bottom = scaleCeil(fusion_pixel_10_zh.line_height, TITLE_SCALE, 1);
+    const int title_bottom = scaleCeil(displayFontLineHeight(), TITLE_SCALE, 1);
     drawRefreshIcon(title_right + 10, max(0, title_bottom - REFRESH_ICON_SIZE - 24), refresh_state);
   }
   drawText(String("任务: ") + task_count + " active", 8, 52, BODY_SCALE);
@@ -1171,6 +1176,104 @@ static void renderTasks() {
   if (ui_canvas) {
     lv_obj_invalidate(ui_canvas);
   }
+}
+
+static void drawBootLoadingRing(int cx, int cy, int phase) {
+  static constexpr int GRID = 24;
+  static constexpr int BLOCK = 3;
+  static constexpr int INNER_R2 = 8 * 8;
+  static constexpr int OUTER_R2 = 11 * 11;
+  static constexpr int SECTORS = 24;
+  static constexpr int GAP = 5;
+  static constexpr float FULL_TURN = 6.28318530718f;
+
+  for (int yy = 0; yy < GRID; yy++) {
+    for (int xx = 0; xx < GRID; xx++) {
+      const float dx = static_cast<float>(xx) - (GRID - 1) / 2.0f;
+      const float dy = static_cast<float>(yy) - (GRID - 1) / 2.0f;
+      const float d2 = dx * dx + dy * dy;
+      if (d2 < INNER_R2 || d2 > OUTER_R2) {
+        continue;
+      }
+      float angle = atan2f(dy, dx);
+      if (angle < 0.0f) {
+        angle += FULL_TURN;
+      }
+      const int sector = min(SECTORS - 1, static_cast<int>(angle * SECTORS / FULL_TURN));
+      if ((sector - phase + SECTORS) % SECTORS < GAP) {
+        continue;
+      }
+      drawRect(cx - GRID * BLOCK / 2 + xx * BLOCK,
+               cy - GRID * BLOCK / 2 + yy * BLOCK,
+               BLOCK, BLOCK, CANVAS_BLACK);
+    }
+  }
+}
+
+static constexpr uint32_t BOOT_LOADING_FRAME_MS = 80;
+static volatile bool boot_loading_active = false;
+static volatile int boot_loading_loaded = 0;
+static volatile int boot_loading_total = 1;
+static TaskHandle_t boot_loading_task_handle = nullptr;
+
+static void flushBootLoadingFrame() {
+  if (!ui_canvas_buf) {
+    return;
+  }
+  lv_area_t area = {0, 0, RlcdDitherDisplay::WIDTH - 1, RlcdDitherDisplay::HEIGHT - 1};
+  display.flushLvgl(&area, reinterpret_cast<const uint8_t *>(ui_canvas_buf));
+}
+
+static void renderBootLoading(int loaded, int total) {
+  clearCanvas();
+  const int clamped_total = max(1, total);
+  const int clamped_loaded = min(clamped_total, max(0, loaded));
+  drawBootLoadingRing(RlcdDitherDisplay::WIDTH / 2, 125, (millis() / BOOT_LOADING_FRAME_MS) % 24);
+
+  static constexpr int BAR_W = 180;
+  static constexpr int BAR_H = 16;
+  const int bar_x = (RlcdDitherDisplay::WIDTH - BAR_W) / 2;
+  const int bar_y = 184;
+  const int inner_w = BAR_W - 8;
+  const int fill_w = inner_w * clamped_loaded / clamped_total;
+  drawMediaProgressBox(bar_x, bar_y, BAR_W, BAR_H, fill_w);
+}
+
+static void drawBootLoadingFrame() {
+  renderBootLoading(boot_loading_loaded, boot_loading_total);
+  flushBootLoadingFrame();
+}
+
+static void bootLoadingTask(void *) {
+  while (boot_loading_active) {
+    drawBootLoadingFrame();
+    vTaskDelay(pdMS_TO_TICKS(BOOT_LOADING_FRAME_MS));
+  }
+  boot_loading_task_handle = nullptr;
+  vTaskDelete(nullptr);
+}
+
+static void showBootLoading(int loaded, int total) {
+  boot_loading_loaded = loaded;
+  boot_loading_total = max(1, total);
+}
+
+static void startBootLoading(int total) {
+  lvglLock(-1);
+  boot_loading_loaded = 0;
+  boot_loading_total = max(1, total);
+  boot_loading_active = true;
+  drawBootLoadingFrame();
+  xTaskCreatePinnedToCore(bootLoadingTask, "BootLoading", 4096, nullptr, 1,
+                          &boot_loading_task_handle, 0);
+}
+
+static void stopBootLoading() {
+  boot_loading_active = false;
+  while (boot_loading_task_handle) {
+    vTaskDelay(pdMS_TO_TICKS(1));
+  }
+  lvglUnlock();
 }
 
 static void updateUi() {

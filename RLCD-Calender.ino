@@ -26,6 +26,7 @@
 #endif
 
 #include <BLEDevice.h>
+#include <FFat.h>
 #include <BLEServer.h>
 #include <HTTPClient.h>
 #include <SD_MMC.h>
@@ -52,8 +53,6 @@
 #define CONFIG_BT_NIMBLE_MAX_CONNECTIONS 1
 #endif
 
-LV_FONT_DECLARE(fusion_pixel_10_zh);
-
 static constexpr int KEY_BUTTON_PIN = 18;
 static constexpr int BOOT_BUTTON_PIN = 0;
 static constexpr uint32_t KEY_DEBOUNCE_MS = 40;
@@ -78,11 +77,12 @@ static constexpr const char *BLE_NOTIFY_DEVICE_NAME = "RLCD-Calender";
 static constexpr const char *BLE_NOTIFY_SERVICE_UUID = "8d2f3a70-7c5a-4db8-9e42-8f2d9b5b9a01";
 static constexpr const char *BLE_NOTIFY_CHARACTERISTIC_UUID = "8d2f3a71-7c5a-4db8-9e42-8f2d9b5b9a01";
 static constexpr uint8_t BLE_NOTIFY_MAX_CLIENTS = CONFIG_BT_NIMBLE_MAX_CONNECTIONS;
-static constexpr uint8_t BLE_PAYLOAD_QUEUE_SIZE = 4;
-static constexpr size_t BLE_PAYLOAD_MAX_LEN = 1024;
+static constexpr uint8_t BLE_PAYLOAD_QUEUE_SIZE = 6;
+static constexpr size_t BLE_PAYLOAD_MAX_LEN = 1536;
 static constexpr int MEDIA_SOURCE_MAX = 4;
-static constexpr int MEDIA_ICON_SIZE = 32;
+static constexpr int MEDIA_ICON_SIZE = 48;
 static constexpr int MEDIA_ICON_BYTES = MEDIA_ICON_SIZE * MEDIA_ICON_SIZE / 8;
+static constexpr int MEDIA_ICON_CHUNK_BYTES = 192;
 static constexpr uint16_t MEDIA_CONN_NONE = 0xffff;
 static constexpr uint32_t MEDIA_DEFAULT_TTL_MS = 5000;
 static constexpr int TASK_LINE_SLOTS_PER_PAGE = 6;
@@ -150,6 +150,7 @@ struct MediaInfo {
   uint16_t conn_id = MEDIA_CONN_NONE;
   bool valid = false;
   bool has_icon = false;
+  uint8_t icon_chunk_mask = 0;
   uint8_t icon[MEDIA_ICON_BYTES] = {};
 };
 
@@ -302,6 +303,11 @@ static void handleBootLongPress();
 static bool isProjectMenuOpen();
 static void toggleScreenMode();
 static ScreenMode currentScreenMode();
+static void startBootLoading(int total);
+static void showBootLoading(int loaded, int total);
+static void stopBootLoading();
+
+#include "FontStorage.inc"
 
 #include "UiTextPages.inc"
 
@@ -338,11 +344,16 @@ void setup() {
     Serial.println("LVGL init failed");
     return;
   }
-
   if (lvglLock(-1)) {
     createUi();
     lvglUnlock();
   }
+  startBootLoading(displayFontCount());
+  if (!initFontStorage()) {
+    Serial.println("[Font] No FATFS fonts loaded");
+  }
+  stopBootLoading();
+  updateUi();
 
 #if ENABLE_TF_CARD_READER
   if (TF_CARD_READER_MODE) {

@@ -194,11 +194,11 @@ static int hexValue(char c) {
   return -1;
 }
 
-static bool parseMediaIconHex(const char *hex, uint8_t *target) {
-  if (!hex || strlen(hex) < MEDIA_ICON_BYTES * 2) {
+static bool parseMediaIconHexBytes(const char *hex, uint8_t *target, int bytes) {
+  if (!hex || bytes <= 0 || strlen(hex) < static_cast<size_t>(bytes * 2)) {
     return false;
   }
-  for (int i = 0; i < MEDIA_ICON_BYTES; i++) {
+  for (int i = 0; i < bytes; i++) {
     const int hi = hexValue(hex[i * 2]);
     const int lo = hexValue(hex[i * 2 + 1]);
     if (hi < 0 || lo < 0) {
@@ -209,9 +209,13 @@ static bool parseMediaIconHex(const char *hex, uint8_t *target) {
   return true;
 }
 
+static bool parseMediaIconHex(const char *hex, uint8_t *target) {
+  return parseMediaIconHexBytes(hex, target, MEDIA_ICON_BYTES);
+}
+
 static void clearMediaSourceLocked(const String &source_id) {
   for (MediaInfo &media : media_sources) {
-    if (media.valid && media.source_id == source_id) {
+    if (media.source_id == source_id) {
       media = MediaInfo();
     }
   }
@@ -225,18 +229,9 @@ static bool parseMediaJson(cJSON *media_json, uint16_t conn_id) {
   if (data_mutex) {
     xSemaphoreTake(data_mutex, portMAX_DELAY);
   }
-  clearMediaSourceLocked(source_id);
-  if (!clear) {
-    MediaInfo *slot = nullptr;
-    for (MediaInfo &media : media_sources) {
-      if (!media.valid && !slot) {
-        slot = &media;
-      }
-    }
-    if (!slot) {
-      slot = &media_sources[0];
-    }
-
+  if (clear) {
+    clearMediaSourceLocked(source_id);
+  } else {
     cJSON *title = cJSON_GetObjectItem(media_json, "title");
     cJSON *artist = cJSON_GetObjectItem(media_json, "artist");
     cJSON *status = cJSON_GetObjectItem(media_json, "status");
@@ -244,19 +239,70 @@ static bool parseMediaJson(cJSON *media_json, uint16_t conn_id) {
     cJSON *dur = cJSON_GetObjectItem(media_json, "dur");
     cJSON *ttl = cJSON_GetObjectItem(media_json, "ttl");
     cJSON *icon = cJSON_GetObjectItem(media_json, "icon");
+    cJSON *icon_part = cJSON_GetObjectItem(media_json, "icon_part");
+    cJSON *icon_total = cJSON_GetObjectItem(media_json, "icon_total");
+    const bool has_info = cJSON_IsString(title) || cJSON_IsString(artist) || cJSON_IsString(status) ||
+                          cJSON_IsNumber(pos) || cJSON_IsNumber(dur);
 
-    *slot = MediaInfo();
+    MediaInfo *slot = nullptr;
+    for (MediaInfo &media : media_sources) {
+      if (media.source_id == source_id) {
+        slot = &media;
+        break;
+      }
+    }
+    if (!slot && !has_info && cJSON_IsString(icon) && (!icon->valuestring || !icon->valuestring[0])) {
+      if (data_mutex) {
+        xSemaphoreGive(data_mutex);
+      }
+      updateUi();
+      return true;
+    }
+    if (!slot) {
+      for (MediaInfo &media : media_sources) {
+        if (media.source_id.length() == 0) {
+          slot = &media;
+          break;
+        }
+      }
+    }
+    if (!slot) {
+      slot = &media_sources[0];
+    }
+
     slot->source_id = source_id;
-    slot->title = cJSON_IsString(title) && title->valuestring ? String(title->valuestring) : String("");
-    slot->artist = cJSON_IsString(artist) && artist->valuestring ? String(artist->valuestring) : String("");
-    slot->status = cJSON_IsString(status) && status->valuestring ? String(status->valuestring) : String("Stopped");
-    slot->position_ms = cJSON_IsNumber(pos) ? static_cast<uint32_t>(max(0, pos->valueint)) : 0;
-    slot->duration_ms = cJSON_IsNumber(dur) ? static_cast<uint32_t>(max(0, dur->valueint)) : 0;
-    slot->updated_ms = millis();
-    slot->expires_ms = slot->updated_ms + (cJSON_IsNumber(ttl) ? max(1000, ttl->valueint) : MEDIA_DEFAULT_TTL_MS);
     slot->conn_id = conn_id;
-    slot->valid = slot->title.length() > 0 || slot->artist.length() > 0;
-    slot->has_icon = cJSON_IsString(icon) && parseMediaIconHex(icon->valuestring, slot->icon);
+    if (has_info) {
+      slot->title = cJSON_IsString(title) && title->valuestring ? String(title->valuestring) : String("");
+      slot->artist = cJSON_IsString(artist) && artist->valuestring ? String(artist->valuestring) : String("");
+      slot->status = cJSON_IsString(status) && status->valuestring ? String(status->valuestring) : String("Stopped");
+      slot->position_ms = cJSON_IsNumber(pos) ? static_cast<uint32_t>(max(0, pos->valueint)) : 0;
+      slot->duration_ms = cJSON_IsNumber(dur) ? static_cast<uint32_t>(max(0, dur->valueint)) : 0;
+      slot->updated_ms = millis();
+      slot->expires_ms = slot->updated_ms + (cJSON_IsNumber(ttl) ? max(1000, ttl->valueint) : MEDIA_DEFAULT_TTL_MS);
+      slot->valid = slot->title.length() > 0 || slot->artist.length() > 0;
+    }
+    if (cJSON_IsString(icon)) {
+      if (cJSON_IsNumber(icon_part) && cJSON_IsNumber(icon_total)) {
+        const int part = icon_part->valueint;
+        const int total = icon_total->valueint;
+        const int offset = part * MEDIA_ICON_CHUNK_BYTES;
+        const int bytes = min(MEDIA_ICON_CHUNK_BYTES, MEDIA_ICON_BYTES - offset);
+        if (part >= 0 && total > 0 && total <= 8 && offset >= 0 && offset < MEDIA_ICON_BYTES &&
+            icon->valuestring && icon->valuestring[0] &&
+            parseMediaIconHexBytes(icon->valuestring, slot->icon + offset, bytes)) {
+          if (part == 0) {
+            slot->icon_chunk_mask = 0;
+            slot->has_icon = false;
+          }
+          slot->icon_chunk_mask |= 1 << part;
+          slot->has_icon = slot->icon_chunk_mask == ((1 << total) - 1);
+        }
+      } else {
+        slot->icon_chunk_mask = 0;
+        slot->has_icon = icon->valuestring && icon->valuestring[0] && parseMediaIconHex(icon->valuestring, slot->icon);
+      }
+    }
   }
   if (data_mutex) {
     xSemaphoreGive(data_mutex);

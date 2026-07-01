@@ -69,13 +69,13 @@ def art_to_hex(art_url):
             side = min(w, h)
             left = (w - side) // 2
             top = (h - side) // 2
-            img = img.crop((left, top, left + side, top + side)).resize((32, 32))
+            img = img.crop((left, top, left + side, top + side)).resize((48, 48))
             img = ImageOps.autocontrast(img.convert("L")).convert("1", dither=Image.Dither.FLOYDSTEINBERG)
             bits = []
             byte = 0
             count = 0
-            for y in range(32):
-                for x in range(32):
+            for y in range(48):
+                for x in range(48):
                     byte = (byte << 1) | (1 if img.getpixel((x, y)) == 0 else 0)
                     count += 1
                     if count == 8:
@@ -90,7 +90,7 @@ def art_to_hex(art_url):
 def media_payload(bus, source_id):
     player = select_player(list_players(bus))
     if not player:
-        return {"media": {"id": source_id, "clear": True}}
+        return {"media": {"id": source_id, "clear": True}}, None
 
     name, status = player
     metadata = get_prop(bus, name, "org.mpris.MediaPlayer2.Player", "Metadata")
@@ -108,9 +108,7 @@ def media_payload(bus, source_id):
         "ttl": 5000,
     }
     icon = art_to_hex(first_text(metadata.get("mpris:artUrl", "")))
-    if icon:
-        media["icon"] = icon
-    return {"media": media}
+    return {"media": media}, icon
 
 
 def send_json(payload, passthrough):
@@ -144,8 +142,13 @@ def main():
     signal.signal(signal.SIGINT, stop)
     signal.signal(signal.SIGTERM, stop)
     bus = dbus.SessionBus()
+    last_icon = None
     while running:
-        send_json(media_payload(bus, args.source_id), passthrough)
+        payload, icon = media_payload(bus, args.source_id)
+        send_json(payload, passthrough)
+        if icon != last_icon:
+            send_json({"media": {"id": args.source_id, "icon": icon or ""}}, passthrough)
+            last_icon = icon
         if args.once:
             return 0
         time.sleep(max(1.0, args.interval))
