@@ -92,23 +92,56 @@ def write_payload(bus, char_path, payload):
     )
 
 
+def read_payload(bus, char_path):
+    characteristic = dbus.Interface(bus.get_object(BLUEZ_SERVICE, char_path), GATT_CHAR_IFACE)
+    value = characteristic.ReadValue(dbus.Dictionary({}, signature="sv"))
+    return bytes(int(byte) for byte in value).decode("utf-8", errors="replace")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Send RLCD notification through BLE GATT.")
     parser.add_argument("--title", default="测试通知", help="popup title")
-    parser.add_argument("--content", required=True, help="popup content")
+    parser.add_argument("--content", help="popup content")
     parser.add_argument("--seconds", type=int, default=8, help="display seconds, 1-60")
+    parser.add_argument("--key", action="store_true", help="simulate KEY click")
+    parser.add_argument("--key2", action="store_true", help="simulate KEY double click")
+    parser.add_argument("--boot", action="store_true", help="simulate BOOT click")
+    parser.add_argument("--boot2", action="store_true", help="simulate BOOT double click")
+    parser.add_argument("--boot-long", action="store_true", help="simulate BOOT long press")
+    parser.add_argument("--status", action="store_true", help="read current device status JSON")
     parser.add_argument("--device-name", default=DEFAULT_DEVICE_NAME)
     parser.add_argument("--address", default="", help="optional connected BLE device address")
     parser.add_argument("--adapter", default="hci0")
     args = parser.parse_args()
 
-    seconds = max(1, min(60, args.seconds))
-    payload = json.dumps(
-        {"t": args.title, "c": args.content, "s": seconds},
-        ensure_ascii=False,
-        separators=(",", ":"),
-    ).encode("utf-8")
-    print(f"payload={payload.decode('utf-8')} bytes={len(payload)}", flush=True)
+    commands = sum([args.key, args.key2, args.boot, args.boot2, args.boot_long, args.status])
+    if commands > 1:
+        print("Use only one command option.", file=sys.stderr, flush=True)
+        return 1
+    if commands == 0 and not args.content:
+        print("--content is required unless a command option is used.", file=sys.stderr, flush=True)
+        return 1
+
+    payload = None
+    if args.key:
+        payload = json.dumps({"cmd": "key"}, separators=(",", ":")).encode("utf-8")
+    elif args.key2:
+        payload = json.dumps({"cmd": "key2"}, separators=(",", ":")).encode("utf-8")
+    elif args.boot:
+        payload = json.dumps({"cmd": "boot"}, separators=(",", ":")).encode("utf-8")
+    elif args.boot2:
+        payload = json.dumps({"cmd": "boot2"}, separators=(",", ":")).encode("utf-8")
+    elif args.boot_long:
+        payload = json.dumps({"cmd": "boot_long"}, separators=(",", ":")).encode("utf-8")
+    elif not args.status:
+        seconds = max(1, min(60, args.seconds))
+        payload = json.dumps(
+            {"t": args.title, "c": args.content, "s": seconds},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    if payload:
+        print(f"payload={payload.decode('utf-8')} bytes={len(payload)}", flush=True)
 
     bus = dbus.SystemBus()
     adapter_path = find_adapter(bus, args.adapter)
@@ -141,9 +174,13 @@ def main():
         print(f"Characteristic not found: {CHARACTERISTIC_UUID}", file=sys.stderr, flush=True)
         return 4
 
-    print(f"writing characteristic {char_path}", flush=True)
-    write_payload(bus, char_path, payload)
-    print("done", flush=True)
+    if payload:
+        print(f"writing characteristic {char_path}", flush=True)
+        write_payload(bus, char_path, payload)
+        print("done", flush=True)
+        time.sleep(0.2)
+    if args.status:
+        print(read_payload(bus, char_path), flush=True)
     return 0
 
 

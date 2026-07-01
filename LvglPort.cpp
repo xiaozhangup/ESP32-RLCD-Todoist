@@ -4,6 +4,7 @@
 #include <esp_heap_caps.h>
 #include <esp_timer.h>
 #include <freertos/FreeRTOS.h>
+#include <freertos/idf_additions.h>
 #include <freertos/semphr.h>
 #include <freertos/task.h>
 
@@ -93,5 +94,13 @@ bool lvglPortInit(int width, int height, LvglFlushCb flush_cb) {
     return false;
   }
 
+  BaseType_t task_result = xTaskCreatePinnedToCoreWithCaps(lvglTask, "LVGL", 8192, nullptr, 5, nullptr, 0,
+                                                           MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (task_result == pdPASS) {
+    return true;
+  }
+
+  Serial.printf("[LVGL] PSRAM task stack allocation failed (%d), falling back to internal RAM\n",
+                static_cast<int>(task_result));
   return xTaskCreatePinnedToCore(lvglTask, "LVGL", 8192, nullptr, 5, nullptr, 0) == pdPASS;
 }
