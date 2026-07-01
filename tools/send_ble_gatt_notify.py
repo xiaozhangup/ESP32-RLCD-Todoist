@@ -102,6 +102,7 @@ def main():
     parser = argparse.ArgumentParser(description="Send RLCD notification through BLE GATT.")
     parser.add_argument("--title", default="测试通知", help="popup title")
     parser.add_argument("--content", help="popup content")
+    parser.add_argument("--json", help="raw JSON payload")
     parser.add_argument("--seconds", type=int, default=8, help="display seconds, 1-60")
     parser.add_argument("--key", action="store_true", help="simulate KEY click")
     parser.add_argument("--key2", action="store_true", help="simulate KEY double click")
@@ -114,7 +115,7 @@ def main():
     parser.add_argument("--adapter", default="hci0")
     args = parser.parse_args()
 
-    commands = sum([args.key, args.key2, args.boot, args.boot2, args.boot_long, args.status])
+    commands = sum([args.key, args.key2, args.boot, args.boot2, args.boot_long, args.status, bool(args.json)])
     if commands > 1:
         print("Use only one command option.", file=sys.stderr, flush=True)
         return 1
@@ -123,7 +124,9 @@ def main():
         return 1
 
     payload = None
-    if args.key:
+    if args.json:
+        payload = args.json.encode("utf-8")
+    elif args.key:
         payload = json.dumps({"cmd": "key"}, separators=(",", ":")).encode("utf-8")
     elif args.key2:
         payload = json.dumps({"cmd": "key2"}, separators=(",", ":")).encode("utf-8")

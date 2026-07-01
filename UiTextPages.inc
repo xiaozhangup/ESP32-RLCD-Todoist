@@ -502,16 +502,36 @@ static String buildClockDateText(const struct tm &now_tm) {
   return String(buffer);
 }
 
+static bool readDisplayTime(struct tm &now_tm) {
+  static constexpr time_t MIN_VALID_TIME = 1577836800;  // 2020-01-01
+  static time_t cached_epoch = 0;
+  static uint32_t cached_ms = 0;
+
+  time_t epoch = time(nullptr);
+  const uint32_t now_ms = millis();
+  if (epoch >= MIN_VALID_TIME) {
+    cached_epoch = epoch;
+    cached_ms = now_ms;
+  } else if (cached_epoch > 0) {
+    epoch = cached_epoch + (now_ms - cached_ms) / 1000;
+  } else {
+    return false;
+  }
+
+  localtime_r(&epoch, &now_tm);
+  return true;
+}
+
 static String buildTopTimeText() {
   struct tm now_tm = {};
-  if (getLocalTime(&now_tm, 0)) {
+  if (readDisplayTime(now_tm)) {
     static constexpr const char *WEEKDAYS[] = {"日", "一", "二", "三", "四", "五", "六"};
     char buffer[48];
     snprintf(buffer, sizeof(buffer), "%04d 星期%s %02d:%02d",
              now_tm.tm_year + 1900, WEEKDAYS[now_tm.tm_wday], now_tm.tm_hour, now_tm.tm_min);
     return String(buffer);
   }
-  return "时间同步中";
+  return "--:--";
 }
 
 static void setAppStatus(const String &status) {
@@ -757,24 +777,152 @@ static int drawRightStatusArea(int battery_snapshot, bool tf_card_snapshot) {
   return time_right - measureTextWidthScaled(buildTopTimeText(), SMALL_SCALE_NUM, SMALL_SCALE_DEN);
 }
 
-static void renderClockScreen(int battery_snapshot, bool tf_card_snapshot,
-                              const WeatherInfo &weather_snapshot, const SensorInfo &sensor_snapshot) {
-  struct tm now_tm = {};
-  drawRightStatusArea(battery_snapshot, tf_card_snapshot);
+static constexpr int MEDIA_ICON_DRAW_SIZE = 48;
 
-  if (!getLocalTime(&now_tm, 0)) {
-    const String waiting = "时间同步中";
-    const int waiting_width = measureTextWidth(waiting, BODY_SCALE);
-    drawText(waiting, (RlcdDitherDisplay::WIDTH - waiting_width) / 2, 128, BODY_SCALE);
+static void drawMediaIcon(const MediaInfo &media, int x, int y) {
+  drawRectOutline(x, y, MEDIA_ICON_DRAW_SIZE, MEDIA_ICON_DRAW_SIZE, 1, CANVAS_BLACK);
+  if (!media.has_icon) {
+    drawText("♪", x + 15, y + 10, BODY_SCALE);
     return;
   }
+  for (int yy = 0; yy < MEDIA_ICON_DRAW_SIZE; yy++) {
+    for (int xx = 0; xx < MEDIA_ICON_DRAW_SIZE; xx++) {
+      const int src_y = yy * MEDIA_ICON_SIZE / MEDIA_ICON_DRAW_SIZE;
+      const int src_x = xx * MEDIA_ICON_SIZE / MEDIA_ICON_DRAW_SIZE;
+      const int bit = src_y * MEDIA_ICON_SIZE + src_x;
+      if (media.icon[bit / 8] & (0x80 >> (bit % 8))) {
+        setCanvasPixel(x + xx, y + yy, CANVAS_BLACK);
+      }
+    }
+  }
+}
 
-  const String time_text = buildClockTimeText(now_tm);
-  const String date_text = buildClockDateText(now_tm);
+static uint32_t mediaPositionNow(const MediaInfo &media, uint32_t now_ms) {
+  uint32_t position = media.position_ms;
+  if (media.status == "Playing") {
+    position += now_ms - media.updated_ms;
+  }
+  if (media.duration_ms > 0 && position > media.duration_ms) {
+    position = media.duration_ms;
+  }
+  return position;
+}
+
+static String formatMediaTime(uint32_t ms, bool pad_minutes) {
+  const uint32_t total_seconds = ms / 1000;
+  const uint32_t hours = total_seconds / 3600;
+  const uint32_t minutes = (total_seconds / 60) % 60;
+  const uint32_t seconds = total_seconds % 60;
+  char buffer[16];
+  if (hours > 0) {
+    snprintf(buffer, sizeof(buffer), "%lu:%02lu:%02lu",
+             static_cast<unsigned long>(hours),
+             static_cast<unsigned long>(minutes),
+             static_cast<unsigned long>(seconds));
+  } else if (pad_minutes) {
+    snprintf(buffer, sizeof(buffer), "%02lu:%02lu",
+             static_cast<unsigned long>(minutes),
+             static_cast<unsigned long>(seconds));
+  } else {
+    snprintf(buffer, sizeof(buffer), "%lu:%02lu",
+             static_cast<unsigned long>(minutes),
+             static_cast<unsigned long>(seconds));
+  }
+  return String(buffer);
+}
+
+static void drawMediaPlaybackIcon(const MediaInfo &media, int x, int y) {
+  static constexpr uint8_t PLAY_MAP[7] = {
+    0b10000,
+    0b11000,
+    0b11100,
+    0b11110,
+    0b11100,
+    0b11000,
+    0b10000,
+  };
+  static constexpr uint8_t PAUSE_MAP[7] = {
+    0b11011,
+    0b11011,
+    0b11011,
+    0b11011,
+    0b11011,
+    0b11011,
+    0b11011,
+  };
+  const uint8_t *map = media.status == "Playing" ? PLAY_MAP : PAUSE_MAP;
+  for (int yy = 0; yy < 7; yy++) {
+    for (int xx = 0; xx < 5; xx++) {
+      if (map[yy] & (0x10 >> xx)) {
+        drawRect(x + xx * 2, y + yy * 2, 2, 2, CANVAS_BLACK);
+      }
+    }
+  }
+}
+
+static void drawMediaProgressBox(int x, int y, int w, int h, int fill_w) {
+  drawRectOutline(x, y, w, h, 2, CANVAS_BLACK);
+  const int inner_x = x + 4;
+  const int inner_y = y + 4;
+  const int inner_w = max(0, w - 8);
+  const int inner_h = max(0, h - 8);
+  const int clamped_fill = min(inner_w, max(0, fill_w));
+  if (clamped_fill > 0 && inner_h > 0) {
+    drawRect(inner_x, inner_y, clamped_fill, inner_h, CANVAS_BLACK);
+  }
+}
+
+static void renderMediaBar(const MediaInfo &media, int y, uint32_t now_ms) {
+  static constexpr int X = RlcdDitherDisplay::WIDTH / 10;
+  static constexpr int RIGHT = RlcdDitherDisplay::WIDTH - X;
+  static constexpr int ICON_GAP = 10;
+  static constexpr int BAR_H = 14;
+  static constexpr int STATUS_ICON_W = 10;
+  const int text_x = X + MEDIA_ICON_DRAW_SIZE + ICON_GAP;
+  const int text_right = RIGHT - 1;
+  const int title_y = y - 1;
+  const int meta_y = y + 26;
+  const int bar_y = y + 53;
+  const int block_center_y = (title_y + bar_y + BAR_H) / 2;
+  const int icon_y = block_center_y - MEDIA_ICON_DRAW_SIZE / 2 + 6;
+  const uint32_t position = mediaPositionNow(media, now_ms);
+  const String duration_text = media.duration_ms > 0 ? formatMediaTime(media.duration_ms, false) : String("--:--");
+  const String time_text = formatMediaTime(position, true) + "/" + duration_text;
+  const int time_width = measureTextWidthScaled(time_text, SMALL_SCALE_NUM, SMALL_SCALE_DEN);
+  const int status_x = max(text_x, RIGHT - time_width - STATUS_ICON_W - 7);
+
+  drawMediaIcon(media, X, icon_y);
+  drawText(truncateUtf8(media.title.length() > 0 ? media.title : String("未知媒体"), 24),
+           text_x, title_y, BODY_SCALE, text_right);
+  drawTextScaled(truncateUtf8(media.artist.length() > 0 ? media.artist : String("未知作者"), 24),
+                 text_x, meta_y, SMALL_SCALE_NUM, SMALL_SCALE_DEN, status_x - 7);
+  drawMediaPlaybackIcon(media, status_x, meta_y + 8);
+  drawRightTextScaled(time_text, RIGHT, meta_y + 1, SMALL_SCALE_NUM, SMALL_SCALE_DEN);
+
+  const int bar_w = RIGHT - text_x;
+  const int inner_w = max(0, bar_w - 8);
+  const int fill_w = media.duration_ms > 0
+                         ? min(inner_w, static_cast<int>((uint64_t)inner_w * position / media.duration_ms))
+                         : 0;
+  drawMediaProgressBox(text_x, bar_y, bar_w, BAR_H, fill_w);
+}
+
+static void renderClockScreen(int battery_snapshot, bool tf_card_snapshot,
+                              const WeatherInfo &weather_snapshot, const SensorInfo &sensor_snapshot,
+                              const MediaInfo &media_snapshot) {
+  struct tm now_tm = {};
+  const bool has_media = media_snapshot.valid;
+  drawRightStatusArea(battery_snapshot, tf_card_snapshot);
+  const bool has_time = readDisplayTime(now_tm);
+  const String time_text = has_time ? buildClockTimeText(now_tm) : String("--:--:--");
+  const String date_text = has_time ? buildClockDateText(now_tm) : String("---- -- --");
   const int time_width = measureTextWidth(time_text, CLOCK_SCALE);
   const int date_width = measureTextWidth(date_text, BODY_SCALE);
-  drawText(time_text, (RlcdDitherDisplay::WIDTH - time_width) / 2, 62, CLOCK_SCALE);
-  drawText(date_text, (RlcdDitherDisplay::WIDTH - date_width) / 2, 158, BODY_SCALE);
+  drawText(time_text, (RlcdDitherDisplay::WIDTH - time_width) / 2, has_media ? 36 : 62, CLOCK_SCALE);
+  drawText(date_text, (RlcdDitherDisplay::WIDTH - date_width) / 2, has_media ? 116 : 158, BODY_SCALE);
+  if (has_media) {
+    renderMediaBar(media_snapshot, 164, millis());
+  }
 
   String weather_text = "天气: 未配置";
   if (weather_snapshot.valid) {
@@ -803,7 +951,7 @@ static void renderClockScreen(int battery_snapshot, bool tf_card_snapshot,
 
   const String env_text = weather_text + " | " + sensor_text;
   const int env_width = measureTextWidth(env_text, BODY_SCALE);
-  drawText(env_text, (RlcdDitherDisplay::WIDTH - env_width) / 2, 218, BODY_SCALE);
+  drawText(env_text, (RlcdDitherDisplay::WIDTH - env_width) / 2, has_media ? 260 : 218, BODY_SCALE);
 }
 
 static void renderTaskScreen(const std::vector<TaskDisplayItem> &task_items,
@@ -943,6 +1091,7 @@ static void renderTasks() {
   BleOverlayInfo overlay_snapshot;
   RefreshVisualState refresh_snapshot = RefreshVisualState::Idle;
   ScreenMode mode_snapshot = ScreenMode::Tasks;
+  MediaInfo media_snapshot;
   std::vector<TodoistProjectItem> project_snapshot;
   String project_name_snapshot;
   int project_menu_index_snapshot = 0;
@@ -959,6 +1108,22 @@ static void renderTasks() {
   }
   if (ble_overlay.visible && static_cast<int32_t>(now_ms - ble_overlay.visible_until_ms) >= 0) {
     ble_overlay.visible = false;
+  }
+  MediaInfo *selected_media = nullptr;
+  for (MediaInfo &media : media_sources) {
+    if (media.valid && static_cast<int32_t>(now_ms - media.expires_ms) >= 0) {
+      media = MediaInfo();
+      continue;
+    }
+    if (!media.valid) {
+      continue;
+    }
+    if (!selected_media || (selected_media->status != "Playing" && media.status == "Playing")) {
+      selected_media = &media;
+    }
+  }
+  if (selected_media) {
+    media_snapshot = *selected_media;
   }
 
   const int task_count = static_cast<int>(tasks.size());
@@ -993,7 +1158,7 @@ static void renderTasks() {
 
   clearCanvas();
   if (mode_snapshot == ScreenMode::Clock) {
-    renderClockScreen(battery_snapshot, tf_card_snapshot, weather_snapshot, sensor_snapshot);
+    renderClockScreen(battery_snapshot, tf_card_snapshot, weather_snapshot, sensor_snapshot, media_snapshot);
   } else {
     renderTaskScreen(task_items, footer_task_count, footer_page, footer_page_count,
                      battery_snapshot, tf_card_snapshot, weather_snapshot, sensor_snapshot,

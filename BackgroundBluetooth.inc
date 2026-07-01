@@ -181,7 +181,91 @@ static bool parseBleOverlayJson(const char *json) {
   return true;
 }
 
-static bool handleBlePayloadJson(const char *json) {
+static int hexValue(char c) {
+  if (c >= '0' && c <= '9') {
+    return c - '0';
+  }
+  if (c >= 'a' && c <= 'f') {
+    return c - 'a' + 10;
+  }
+  if (c >= 'A' && c <= 'F') {
+    return c - 'A' + 10;
+  }
+  return -1;
+}
+
+static bool parseMediaIconHex(const char *hex, uint8_t *target) {
+  if (!hex || strlen(hex) < MEDIA_ICON_BYTES * 2) {
+    return false;
+  }
+  for (int i = 0; i < MEDIA_ICON_BYTES; i++) {
+    const int hi = hexValue(hex[i * 2]);
+    const int lo = hexValue(hex[i * 2 + 1]);
+    if (hi < 0 || lo < 0) {
+      return false;
+    }
+    target[i] = static_cast<uint8_t>((hi << 4) | lo);
+  }
+  return true;
+}
+
+static void clearMediaSourceLocked(const String &source_id) {
+  for (MediaInfo &media : media_sources) {
+    if (media.valid && media.source_id == source_id) {
+      media = MediaInfo();
+    }
+  }
+}
+
+static bool parseMediaJson(cJSON *media_json, uint16_t conn_id) {
+  cJSON *id = cJSON_GetObjectItem(media_json, "id");
+  const String source_id = cJSON_IsString(id) && id->valuestring ? String(id->valuestring) : String("ble");
+  const bool clear = cJSON_IsTrue(cJSON_GetObjectItem(media_json, "clear"));
+
+  if (data_mutex) {
+    xSemaphoreTake(data_mutex, portMAX_DELAY);
+  }
+  clearMediaSourceLocked(source_id);
+  if (!clear) {
+    MediaInfo *slot = nullptr;
+    for (MediaInfo &media : media_sources) {
+      if (!media.valid && !slot) {
+        slot = &media;
+      }
+    }
+    if (!slot) {
+      slot = &media_sources[0];
+    }
+
+    cJSON *title = cJSON_GetObjectItem(media_json, "title");
+    cJSON *artist = cJSON_GetObjectItem(media_json, "artist");
+    cJSON *status = cJSON_GetObjectItem(media_json, "status");
+    cJSON *pos = cJSON_GetObjectItem(media_json, "pos");
+    cJSON *dur = cJSON_GetObjectItem(media_json, "dur");
+    cJSON *ttl = cJSON_GetObjectItem(media_json, "ttl");
+    cJSON *icon = cJSON_GetObjectItem(media_json, "icon");
+
+    *slot = MediaInfo();
+    slot->source_id = source_id;
+    slot->title = cJSON_IsString(title) && title->valuestring ? String(title->valuestring) : String("");
+    slot->artist = cJSON_IsString(artist) && artist->valuestring ? String(artist->valuestring) : String("");
+    slot->status = cJSON_IsString(status) && status->valuestring ? String(status->valuestring) : String("Stopped");
+    slot->position_ms = cJSON_IsNumber(pos) ? static_cast<uint32_t>(max(0, pos->valueint)) : 0;
+    slot->duration_ms = cJSON_IsNumber(dur) ? static_cast<uint32_t>(max(0, dur->valueint)) : 0;
+    slot->updated_ms = millis();
+    slot->expires_ms = slot->updated_ms + (cJSON_IsNumber(ttl) ? max(1000, ttl->valueint) : MEDIA_DEFAULT_TTL_MS);
+    slot->conn_id = conn_id;
+    slot->valid = slot->title.length() > 0 || slot->artist.length() > 0;
+    slot->has_icon = cJSON_IsString(icon) && parseMediaIconHex(icon->valuestring, slot->icon);
+  }
+  if (data_mutex) {
+    xSemaphoreGive(data_mutex);
+  }
+  updateUi();
+  return true;
+}
+
+static bool handleBlePayloadJson(const char *json, uint16_t conn_id = MEDIA_CONN_NONE) {
   cJSON *root = cJSON_Parse(json);
   if (!root) {
     Serial.printf("[BLE] Invalid JSON near: %s\n", cJSON_GetErrorPtr());
@@ -213,11 +297,18 @@ static bool handleBlePayloadJson(const char *json) {
     return true;
   }
 
+  cJSON *media = cJSON_GetObjectItem(root, "media");
+  if (cJSON_IsObject(media)) {
+    const bool ok = parseMediaJson(media, conn_id);
+    cJSON_Delete(root);
+    return ok;
+  }
+
   cJSON_Delete(root);
   return parseBleOverlayJson(json);
 }
 
-static void enqueueBlePayload(const String &payload) {
+static void enqueueBlePayload(const String &payload, uint16_t conn_id = MEDIA_CONN_NONE) {
   if (ble_payload_mutex) {
     xSemaphoreTake(ble_payload_mutex, portMAX_DELAY);
   }
@@ -228,6 +319,7 @@ static void enqueueBlePayload(const String &payload) {
   const size_t copy_len = min(payload.length(), BLE_PAYLOAD_MAX_LEN - 1);
   memcpy(ble_payload_buffer[ble_payload_head], payload.c_str(), copy_len);
   ble_payload_buffer[ble_payload_head][copy_len] = '\0';
+  ble_payload_conn_buffer[ble_payload_head] = conn_id;
   ble_payload_head = (ble_payload_head + 1) % BLE_PAYLOAD_QUEUE_SIZE;
   ble_payload_count++;
   ble_payload_pending = ble_payload_count > 0;
@@ -236,14 +328,16 @@ static void enqueueBlePayload(const String &payload) {
   }
 }
 
-static bool takeBlePayload(String &payload) {
+static bool takeBlePayload(String &payload, uint16_t &conn_id) {
   bool has_payload = false;
   if (ble_payload_mutex) {
     xSemaphoreTake(ble_payload_mutex, portMAX_DELAY);
   }
   if (ble_payload_count > 0) {
     payload = ble_payload_buffer[ble_payload_tail];
+    conn_id = ble_payload_conn_buffer[ble_payload_tail];
     ble_payload_buffer[ble_payload_tail][0] = '\0';
+    ble_payload_conn_buffer[ble_payload_tail] = MEDIA_CONN_NONE;
     ble_payload_tail = (ble_payload_tail + 1) % BLE_PAYLOAD_QUEUE_SIZE;
     ble_payload_count--;
     ble_payload_pending = ble_payload_count > 0;
@@ -319,16 +413,40 @@ class BleNotifyServerCallbacks : public BLEServerCallbacks {
   void onDisconnect(BLEServer *server) override {
     ble_client_count = static_cast<uint8_t>(min<uint32_t>(BLE_NOTIFY_MAX_CLIENTS, server->getConnectedCount()));
     ble_status_dirty = true;
+    if (ble_client_count == 0 && data_mutex) {
+      xSemaphoreTake(data_mutex, portMAX_DELAY);
+      for (MediaInfo &media : media_sources) {
+        media = MediaInfo();
+      }
+      xSemaphoreGive(data_mutex);
+    }
     Serial.printf("[BLE] Client disconnected, count=%u/%u\n",
                   static_cast<unsigned>(ble_client_count), static_cast<unsigned>(BLE_NOTIFY_MAX_CLIENTS));
     server->startAdvertising();
+  }
+
+  void onDisconnect(BLEServer *, ble_gap_conn_desc *desc) override {
+    if (!desc || !data_mutex) {
+      return;
+    }
+    xSemaphoreTake(data_mutex, portMAX_DELAY);
+    for (MediaInfo &media : media_sources) {
+      if (media.valid && media.conn_id == desc->conn_handle) {
+        media = MediaInfo();
+      }
+    }
+    xSemaphoreGive(data_mutex);
+    updateUi();
   }
 };
 
 class BleNotifyWriteCallbacks : public BLECharacteristicCallbacks {
   void onWrite(BLECharacteristic *characteristic) override {
-    const String value = characteristic->getValue();
-    enqueueBlePayload(value);
+    enqueueBlePayload(characteristic->getValue());
+  }
+
+  void onWrite(BLECharacteristic *characteristic, ble_gap_conn_desc *desc) override {
+    enqueueBlePayload(characteristic->getValue(), desc ? desc->conn_handle : MEDIA_CONN_NONE);
   }
 
   void onRead(BLECharacteristic *characteristic) override {

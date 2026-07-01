@@ -80,6 +80,11 @@ static constexpr const char *BLE_NOTIFY_CHARACTERISTIC_UUID = "8d2f3a71-7c5a-4db
 static constexpr uint8_t BLE_NOTIFY_MAX_CLIENTS = CONFIG_BT_NIMBLE_MAX_CONNECTIONS;
 static constexpr uint8_t BLE_PAYLOAD_QUEUE_SIZE = 4;
 static constexpr size_t BLE_PAYLOAD_MAX_LEN = 1024;
+static constexpr int MEDIA_SOURCE_MAX = 4;
+static constexpr int MEDIA_ICON_SIZE = 32;
+static constexpr int MEDIA_ICON_BYTES = MEDIA_ICON_SIZE * MEDIA_ICON_SIZE / 8;
+static constexpr uint16_t MEDIA_CONN_NONE = 0xffff;
+static constexpr uint32_t MEDIA_DEFAULT_TTL_MS = 5000;
 static constexpr int TASK_LINE_SLOTS_PER_PAGE = 6;
 static constexpr int TASK_TEXT_COLUMNS = 38;
 static constexpr int TASK_MAX_LINES = 2;
@@ -133,6 +138,21 @@ struct BleOverlayInfo {
   bool visible = false;
 };
 
+struct MediaInfo {
+  String source_id;
+  String title;
+  String artist;
+  String status;
+  uint32_t position_ms = 0;
+  uint32_t duration_ms = 0;
+  uint32_t updated_ms = 0;
+  uint32_t expires_ms = 0;
+  uint16_t conn_id = MEDIA_CONN_NONE;
+  bool valid = false;
+  bool has_icon = false;
+  uint8_t icon[MEDIA_ICON_BYTES] = {};
+};
+
 enum class ScreenMode {
   Tasks,
   Clock,
@@ -174,6 +194,7 @@ static std::vector<TodoistTaskItem> tasks;
 static WeatherInfo weather_info;
 static SensorInfo sensor_info;
 static BleOverlayInfo ble_overlay;
+static MediaInfo media_sources[MEDIA_SOURCE_MAX];
 static volatile bool ble_overlay_dirty = false;
 static volatile bool ble_status_dirty = false;
 static volatile bool ble_payload_pending = false;
@@ -195,6 +216,7 @@ static uint32_t refresh_done_until_ms = 0;
 static uint32_t last_time_sync_ms = 0;
 static String app_status = "Starting";
 static char ble_payload_buffer[BLE_PAYLOAD_QUEUE_SIZE][BLE_PAYLOAD_MAX_LEN] = {};
+static uint16_t ble_payload_conn_buffer[BLE_PAYLOAD_QUEUE_SIZE] = {};
 
 static void flushCallback(lv_display_t *disp, const lv_area_t *area, uint8_t *color_map) {
   display.flushLvgl(area, color_map);
@@ -450,8 +472,9 @@ void loop() {
     updateUi();
   }
   String ble_payload;
-  if (takeBlePayload(ble_payload)) {
-    handleBlePayloadJson(ble_payload.c_str());
+  uint16_t ble_payload_conn_id = MEDIA_CONN_NONE;
+  if (takeBlePayload(ble_payload, ble_payload_conn_id)) {
+    handleBlePayloadJson(ble_payload.c_str(), ble_payload_conn_id);
   }
   if (isRefreshSpinning() && now - last_spinner_ms >= SPINNER_REFRESH_MS) {
     last_spinner_ms = now;
